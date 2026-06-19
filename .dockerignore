@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.git/
+.gitignore
+.dockerignore
+venv/
+.venv/
+node_modules/
+crawl_output/
+.agents/
+.gemini/
