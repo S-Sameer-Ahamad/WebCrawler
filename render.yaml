@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: webcrawler
+    env: docker
+    plan: starter
+    envVars:
+      - key: SAAS_BACKEND_URL
+        sync: false
+      - key: CRAWLER_INTERNAL_TOKEN
+        sync: false
+      - key: CRAWLER_API_TOKEN
+        sync: false
+      - key: MAX_BACKEND_SEND_CONCURRENCY
+        value: "3"
+      - key: MAX_BACKEND_FAILURE_RATE
+        value: "0.8"
+      - key: MIN_SEND_ATTEMPTS_BEFORE_ABORT
+        value: "5"
