@@ -809,13 +809,25 @@ async def click_expand_and_harvest(page: Page, current_url: str,
                     if navigated:
                         # The original page navigated away — restore it so we
                         # can keep clicking the remaining elements.
+                        restore_success = False
                         try:
-                            await page.goto(current_url, wait_until="domcontentloaded",
-                                             timeout=max(navigation_timeout_ms, 10000))
-                            await page.wait_for_timeout(min(post_click_wait_ms, 800))
-                        except Exception as restore_err:
-                            print(f"  [RESTORE FAILED] {current_url}: {restore_err}")
-                            break  # can't keep iterating safely on this page
+                            # Try going back first (faster, avoids full reload)
+                            await page.go_back(wait_until="domcontentloaded", timeout=max(navigation_timeout_ms, 6000))
+                            if clean_and_normalize_url(page.url) == clean_and_normalize_url(current_url):
+                                await page.wait_for_timeout(min(post_click_wait_ms, 600))
+                                restore_success = True
+                        except Exception:
+                            pass
+
+                        if not restore_success:
+                            try:
+                                # Fallback to full reload with a higher timeout
+                                await page.goto(current_url, wait_until="domcontentloaded",
+                                                 timeout=max(navigation_timeout_ms, 25000))
+                                await page.wait_for_timeout(min(post_click_wait_ms, 800))
+                            except Exception as restore_err:
+                                print(f"  [RESTORE FAILED] {current_url}: {restore_err}")
+                                break  # can't keep iterating safely on this page
                         continue
                     if nav_candidates:
                         # popup case — original page untouched, just continue
