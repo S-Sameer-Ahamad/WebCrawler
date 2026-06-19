@@ -2,10 +2,11 @@ services:
   - type: web
     name: webcrawler
     env: docker
-    plan: starter
+    plan: free
+    healthCheckPath: /health
     envVars:
       - key: SAAS_BACKEND_URL
-        sync: false
+        value: https://nexora-api-ngnu.onrender.com
       - key: CRAWLER_INTERNAL_TOKEN
         sync: false
       - key: CRAWLER_API_TOKEN
