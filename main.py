@@ -220,17 +220,61 @@ def is_bare_detail_stub(url: str) -> bool:
     return last.endswith("-details") or last.endswith("-detail")
 
 
+def is_useful_same_domain_url(path: str) -> bool:
+    p = path.strip().lower().rstrip("/")
+    if p == "" or p == "/":
+        return True
+    
+    useful_exact = {
+        "/about", "/about-us",
+        "/service", "/services",
+        "/blog",
+        "/career", "/careers",
+        "/success-stories", "/success-story",
+        "/contact", "/contact-us",
+        "/privacy-policy", "/privacy",
+        "/terms-condition", "/terms-conditions", "/terms"
+    }
+    if p in useful_exact:
+        return True
+        
+    useful_prefixes = (
+        "/service-details/",
+        "/blog-details/",
+        "/career-details/"
+    )
+    if p.startswith(useful_prefixes):
+        return True
+        
+    return False
+
+
 def should_skip_query_url(url: str, follow_query_urls: bool) -> bool:
     parsed = urlparse(url)
     if not parsed.query: return False
-    keys = {key.lower() for key, _ in parse_qsl(parsed.query, keep_blank_values=True)}
-    blocked = {"tag", "tags", "search", "q", "s", "sort", "filter", "filters",
-               "category", "cat", "author", "replytocom", "share", "output", "format", "view"}
+    
+    try:
+        keys = {key.lower() for key, _ in parse_qsl(parsed.query, keep_blank_values=True)}
+    except Exception:
+        keys = set()
+        
+    blocked = {"tag", "tags", "category", "cat", "search", "q", "s", "submit", "keywords", "city"}
     if keys & blocked: return True
+    
+    path = parsed.path.lower()
+    # blog-category.php?tag=...
+    if "blog-category.php" in path and ("tag" in keys or "tag=" in parsed.query.lower()):
+        return True
+        
+    # career?city=&keywords=&submit=
+    if "career" in path and ("city" in keys or "keywords" in keys or "submit" in keys):
+        return True
+        
     if not follow_query_urls:
         allowed = {"page", "p", "id", "slug"}
         if keys and not keys.issubset(allowed): return True
         if len(keys) > 2: return True
+        
     return False
 
 
@@ -244,6 +288,12 @@ def should_reject_url(url: str, root_domain: str, follow_query_urls: bool) -> Tu
     if is_likely_action_endpoint(url): return True, "action_endpoint"
     if should_skip_query_url(url, follow_query_urls): return True, "query_policy"
     if len([seg for seg in parsed.path.split("/") if seg]) > 12: return True, "path_too_deep"
+    
+    # Whitelist path check when follow_query_urls=false
+    if not follow_query_urls:
+        if not is_useful_same_domain_url(parsed.path):
+            return True, "not_useful_path"
+            
     return False, "accepted"
 
 
@@ -731,7 +781,9 @@ async def click_expand_and_harvest(page: Page, current_url: str,
                                     max_navigation_clicks: int,
                                     navigation_timeout_ms: int,
                                     skip_nav_region: bool = False,
-                                    stats: dict = None) -> Tuple[List[Candidate], str]:
+                                    stats: dict = None,
+                                    job_id: str = None,
+                                    worker_id: int = None) -> Tuple[List[Candidate], str]:
     """
     Strategy 2 – Clickable cards, accordions, "View Details", nav items with
     placeholder hrefs, tabs: click every interactive element, and for each
@@ -821,7 +873,7 @@ async def click_expand_and_harvest(page: Page, current_url: str,
                         c.anchor_text = c.anchor_text or el_text
                         candidates.append(c)
                         norm = clean_and_normalize_url(c.url)
-                        print(f"  [NAV CLICK REVEALED] {norm} (via '{el_text[:50]}')")
+                        print(f"  [NAV CLICK REVEALED] [{job_id}] [worker-{worker_id}]: {norm} (via '{el_text[:50]}')")
                     if navigated:
                         # The original page navigated away — restore it so we
                         # can keep clicking the remaining elements.
@@ -874,7 +926,7 @@ async def click_expand_and_harvest(page: Page, current_url: str,
                     norm = clean_and_normalize_url(c.url)
                     baseline_links.add(norm)
                     candidates.append(c)
-                    print(f"  [CLICK REVEALED] {norm} (via '{el_text[:50]}')")
+                    print(f"  [CLICK REVEALED] [{job_id}] [worker-{worker_id}]: {norm} (via '{el_text[:50]}')")
 
                 try:
                     modal_text = await page.evaluate("""() => {
@@ -1106,7 +1158,8 @@ async def run_recursive_crawl(req: CrawlRequest, job_id: str):
         "onclick_links_found": 0,
         "nav_fingerprint_cache_hits": 0,
         "restore_via_back": 0,
-        "restore_via_goto": 0
+        "restore_via_goto": 0,
+        "page_errors": 0
     }
     nav_fingerprints_seen: set = set()
 
@@ -1137,12 +1190,197 @@ async def run_recursive_crawl(req: CrawlRequest, job_id: str):
         sitemap_candidates = await discover_sitemap_urls(start_url, domain)
         print(f"[SITEMAP] Found {len(sitemap_candidates)} URLs")
         for c in sitemap_candidates:
-            enqueue(c, 1)
-
-    update_crawl_job_status(job_id, "PROCESSING", current_url=start_url)
+           update_crawl_job_status(job_id, "PROCESSING", current_url=start_url)
+    print(f"[JOB START] [{job_id}] [worker-system]: URL: {start_url}, concurrent_workers: {req.concurrent_workers}")
 
     send_semaphore = asyncio.Semaphore(MAX_BACKEND_SEND_CONCURRENCY)
     abort_crawling = False
+
+    async def process_page(worker_id: int, ctx: BrowserContext, url: str, client: httpx.AsyncClient, semaphore: asyncio.Semaphore):
+        info = discovered.get(url)
+        if not info or info["status"] != "pending": return
+        info["status"] = "processing"
+        stats["crawled_pages"] += 1
+        depth = info["depth"]
+
+        print(f"[{stats['crawled_pages']}/{req.max_pages}] Crawling [{job_id}] [worker-{worker_id}]: {url} (depth={depth})")
+
+        page = await ctx.new_page()
+        try:
+            try:
+                resp = await page.goto(
+                    url, wait_until="domcontentloaded", timeout=req.page_timeout_ms
+                )
+                if resp and resp.status >= 400:
+                    info["status"] = f"failed_{resp.status}"
+                    return
+                await page.wait_for_load_state(
+                    "networkidle", timeout=req.network_idle_timeout_ms
+                )
+            except PlaywrightTimeoutError:
+                pass
+
+            await auto_scroll(page, req.max_scroll_px)
+            if req.post_load_wait_ms > 0:
+                await page.wait_for_timeout(req.post_load_wait_ms)
+
+            onclick_candidates = await harvest_onclick_urls(page, url)
+            stats["onclick_links_found"] += len(onclick_candidates)
+            for c in onclick_candidates:
+                enqueue(c, depth + 1)
+
+            skip_nav = False
+            if req.enable_nav_fingerprint_cache:
+                fingerprint = await compute_nav_fingerprint(page)
+                if fingerprint:
+                    if fingerprint in nav_fingerprints_seen:
+                        skip_nav = True
+                        stats["nav_fingerprint_cache_hits"] += 1
+                        print(f"[NAV CACHE HIT] [{job_id}] [worker-{worker_id}]: Skipping nav/menu discovery for {url} (fingerprint={fingerprint[:10]})")
+                    else:
+                        nav_fingerprints_seen.add(fingerprint)
+
+            nav_candidates: List[Candidate] = []
+            if req.use_menu_discovery and depth <= req.menu_discovery_max_depth and not skip_nav:
+                nav_candidates = await nav_hover_and_harvest(
+                    page, url,
+                    hover_wait_ms=req.nav_hover_wait_ms,
+                    max_items=req.max_nav_items_to_hover
+                )
+                stats["menus_interacted"] += 1
+                stats["nav_links_found"] += len(nav_candidates)
+                for c in nav_candidates:
+                    enqueue(c, depth + 1)
+
+            click_candidates: List[Candidate] = []
+            revealed_md = ""
+            if req.use_click_discovery and depth <= req.click_discovery_max_depth:
+                click_candidates, revealed_text = await click_expand_and_harvest(
+                    page, url,
+                    post_click_wait_ms=req.post_click_wait_ms,
+                    max_buttons=req.max_buttons_to_click,
+                    enable_navigation_detection=req.enable_navigation_click_discovery,
+                    max_navigation_clicks=req.max_navigation_clicks_per_page,
+                    navigation_timeout_ms=req.navigation_click_timeout_ms,
+                    skip_nav_region=skip_nav,
+                    stats=stats,
+                    job_id=job_id,
+                    worker_id=worker_id
+                )
+                stats["clicks_interacted"] += 1
+                stats["click_links_found"] += len(click_candidates)
+                stats["navigation_links_found"] += sum(
+                    1 for c in click_candidates
+                    if c.source in ("card_click_revealed", "nav_click_revealed", "popup_click_revealed")
+                )
+                for c in click_candidates:
+                    enqueue(c, depth + 1)
+                if revealed_text and req.extract_click_revealed_content:
+                    revealed_md = f"\n\n---\n\n# Click-Revealed Content\n\n{revealed_text}"
+
+            if req.hash_nav_discovery and depth <= req.click_discovery_max_depth:
+                hash_candidates = await extract_hash_nav_candidates(
+                    page, url, post_click_wait_ms=req.post_click_wait_ms
+                )
+                stats["hash_links_found"] += len(hash_candidates)
+                for c in hash_candidates:
+                    enqueue(c, depth + 1)
+
+            for route in await intercept_spa_routes(page):
+                if route and isinstance(route, str):
+                    enqueue(Candidate(
+                        url=urljoin(url, route), source="spa_routing", parent_url=url
+                    ), depth + 1)
+
+            html = await page.content()
+            for c in await harvest_visible_links(page, url, source="dom_post_interaction"):
+                enqueue(c, depth + 1)
+            for c in discover_route_patterns_from_html(html, url):
+                enqueue(c, depth + 1)
+
+            title = await page.title()
+            raw_md = await asyncio.to_thread(_cpu_clean_html_to_markdown, html)
+            if revealed_md:
+                raw_md += revealed_md
+
+            if req.enable_preprocessing:
+                md_text, rep = await asyncio.to_thread(
+                    _cpu_preprocess_markdown, raw_md, title, url
+                )
+            else:
+                md_text, rep = raw_md, {}
+
+            low_qual, reason = is_low_quality_markdown(md_text, title, req.min_markdown_chars)
+            if low_qual:
+                info["status"] = f"skipped_{reason}"
+                print(f"[SKIP] [{job_id}] [worker-{worker_id}]: {url} -> {reason}")
+                return
+
+            content_sig = get_content_signature(md_text)
+            if content_sig in JOBS[job_id]["content_signatures"]:
+                info["status"] = "skipped_duplicate_content"
+                stats["skipped_duplicates"] += 1
+                print(f"[SKIP DUPLICATE] [{job_id}] [worker-{worker_id}]: {url}")
+                return
+            JOBS[job_id]["content_signatures"].add(content_sig)
+
+            content_hash = hashlib.sha256(md_text.encode("utf-8")).hexdigest()
+
+            success, status_code, resp_body = await send_page_to_saas_backend(
+                client=client,
+                semaphore=semaphore,
+                tenant_id=req.tenant_id,
+                agent_id=req.agent_id,
+                url=url,
+                title=title,
+                markdown=md_text,
+                content_hash=content_hash,
+                depth=depth,
+                score=info["score"],
+                source=info["source"],
+                preprocessing_report=rep
+            )
+
+            if success:
+                stats["sent_pages"] += 1
+                info["status"] = "completed"
+                document_id = None
+                ingestion_job_id = None
+                try:
+                    resp_json = json.loads(resp_body)
+                    document_id = resp_json.get("document_id") or resp_json.get("id")
+                    ingestion_job_id = resp_json.get("ingestion_job_id") or resp_json.get("job_id")
+                except Exception:
+                    pass
+                print(f"[SEND SUCCESS] [{job_id}] [worker-{worker_id}]: {url} -> status {status_code}, document_id={document_id}, ingestion_job_id={ingestion_job_id}")
+            else:
+                stats["failed_sends"] += 1
+                info["status"] = "failed_send"
+                stats["last_error"] = f"Backend HTTP {status_code}: {resp_body[:300]}"
+                print(f"[SEND FAILED] [{job_id}] [worker-{worker_id}]: {url} -> status {status_code}")
+
+        except Exception as e:
+            err_msg = str(e)
+            print(f"[PAGE ERROR] [{job_id}] [worker-{worker_id}]: {url}: {err_msg}")
+            info["status"] = "failed"
+            stats["last_error"] = err_msg
+            stats["page_errors"] = stats.get("page_errors", 0) + 1
+            is_closed_err = any(phrase in err_msg for phrase in (
+                "Target page, context or browser has been closed",
+                "has been closed",
+                "BrowserContext.new_page",
+                "Page.goto",
+                "Browser context closed"
+            ))
+            if is_closed_err:
+                raise e
+        finally:
+            try:
+                await page.close()
+            except Exception:
+                pass
+            JOBS[job_id]["discovered_urls"] = len(discovered)
+            JOBS[job_id].update(stats)
 
     async with httpx.AsyncClient(timeout=30.0) as http_client:
         async with async_playwright() as p:
@@ -1151,235 +1389,103 @@ async def run_recursive_crawl(req: CrawlRequest, job_id: str):
                 args=["--disable-gpu", "--disable-dev-shm-usage", "--disable-extensions"]
             )
 
-            context = await browser.new_context(viewport={"width": 1440, "height": 900})
-            await context.add_init_script("""
-                window.__spa_routes = new Set();
-                const _push = history.pushState;
-                const _replace = history.replaceState;
-                history.pushState = function(s, u, url) {
-                    if (url) window.__spa_routes.add(url.toString());
-                    return _push.apply(this, arguments);
-                };
-                history.replaceState = function(s, u, url) {
-                    if (url) window.__spa_routes.add(url.toString());
-                    return _replace.apply(this, arguments);
-                };
-                window.addEventListener('hashchange', () => {
-                    window.__spa_routes.add(location.href);
-                });
-            """)
-
-            if req.block_heavy_resources or req.block_tracking_scripts:
-                def _should_abort(route_request) -> bool:
-                    if req.block_heavy_resources and route_request.resource_type in {"image", "media", "font", "stylesheet"}:
-                        return True
-                    if req.block_tracking_scripts and is_tracking_request(route_request.url):
-                        return True
-                    return False
-
-                await context.route(
-                    "**/*",
-                    lambda r: r.abort() if _should_abort(r.request) else r.continue_()
-                )
-
-            async def worker():
+            async def worker(worker_id: int):
                 nonlocal abort_crawling
-                while True:
-                    if not abort_crawling:
-                        total_attempts = stats["sent_pages"] + stats["failed_sends"]
-                        if total_attempts >= MIN_SEND_ATTEMPTS_BEFORE_ABORT:
-                            failure_rate = stats["failed_sends"] / total_attempts
-                            if failure_rate > MAX_BACKEND_FAILURE_RATE:
-                                stats["last_error"] = f"Aborted: Backend failure rate {failure_rate:.1%} exceeded threshold of {MAX_BACKEND_FAILURE_RATE:.1%}."
-                                abort_crawling = True
-                                update_crawl_job_status(job_id, "FAILED", **stats)
+                ctx = None
 
-                    try:
-                        score_inv, _, url = await queue.get()
-                        if stats["crawled_pages"] >= req.max_pages or abort_crawling:
-                            queue.task_done()
-                            continue
+                async def create_ctx():
+                    nonlocal ctx
+                    if ctx:
                         try:
+                            await ctx.close()
+                        except Exception:
+                            pass
+                    ctx = await browser.new_context(viewport={"width": 1440, "height": 900})
+                    await ctx.add_init_script("""
+                        window.__spa_routes = new Set();
+                        const _push = history.pushState;
+                        const _replace = history.replaceState;
+                        history.pushState = function(s, u, url) {
+                            if (url) window.__spa_routes.add(url.toString());
+                            return _push.apply(this, arguments);
+                        };
+                        history.replaceState = function(s, u, url) {
+                            if (url) window.__spa_routes.add(url.toString());
+                            return _replace.apply(this, arguments);
+                        };
+                        window.addEventListener('hashchange', () => {
+                            window.__spa_routes.add(location.href);
+                        });
+                    """)
+                    if req.block_heavy_resources or req.block_tracking_scripts:
+                        def _should_abort(route_request) -> bool:
+                            if req.block_heavy_resources and route_request.resource_type in {"image", "media", "font", "stylesheet"}:
+                                return True
+                            if req.block_tracking_scripts and is_tracking_request(route_request.url):
+                                return True
+                            return False
+
+                        await ctx.route(
+                            "**/*",
+                            lambda r: r.abort() if _should_abort(r.request) else r.continue_()
+                        )
+
+                await create_ctx()
+                try:
+                    while True:
+                        if not abort_crawling:
+                            total_attempts = stats["sent_pages"] + stats["failed_sends"]
+                            if total_attempts >= MIN_SEND_ATTEMPTS_BEFORE_ABORT:
+                                failure_rate = stats["failed_sends"] / total_attempts
+                                if failure_rate > MAX_BACKEND_FAILURE_RATE:
+                                    stats["last_error"] = f"Aborted: Backend failure rate {failure_rate:.1%} exceeded threshold of {MAX_BACKEND_FAILURE_RATE:.1%}."
+                                    abort_crawling = True
+                                    update_crawl_job_status(job_id, "FAILED", **stats)
+
+                        try:
+                            score_inv, _, url = await queue.get()
+                            if stats["crawled_pages"] >= req.max_pages or abort_crawling:
+                                queue.task_done()
+                                continue
+                            
                             stats["current_url"] = url
                             update_crawl_job_status(job_id, JOBS[job_id]["status"], **stats)
-                            await process_page(context, url, http_client, send_semaphore)
-                        finally:
-                            queue.task_done()
-                    except asyncio.CancelledError:
-                        break
-                    except Exception as e:
-                        print(f"[WORKER ERR] {e}")
-
-            async def process_page(ctx: BrowserContext, url: str, client: httpx.AsyncClient, semaphore: asyncio.Semaphore):
-                info = discovered.get(url)
-                if not info or info["status"] != "pending": return
-                info["status"] = "processing"
-                stats["crawled_pages"] += 1
-                depth = info["depth"]
-
-                print(f"[{stats['crawled_pages']}/{req.max_pages}] Crawling: {url} (depth={depth})")
-
-                page = await ctx.new_page()
-                try:
-                    try:
-                        resp = await page.goto(
-                            url, wait_until="domcontentloaded", timeout=req.page_timeout_ms
-                        )
-                        if resp and resp.status >= 400:
-                            info["status"] = f"failed_{resp.status}"
-                            return
-                        await page.wait_for_load_state(
-                            "networkidle", timeout=req.network_idle_timeout_ms
-                        )
-                    except PlaywrightTimeoutError:
-                        pass
-
-                    await auto_scroll(page, req.max_scroll_px)
-                    if req.post_load_wait_ms > 0:
-                        await page.wait_for_timeout(req.post_load_wait_ms)
-
-                    onclick_candidates = await harvest_onclick_urls(page, url)
-                    stats["onclick_links_found"] += len(onclick_candidates)
-                    for c in onclick_candidates:
-                        enqueue(c, depth + 1)
-
-                    skip_nav = False
-                    if req.enable_nav_fingerprint_cache:
-                        fingerprint = await compute_nav_fingerprint(page)
-                        if fingerprint:
-                            if fingerprint in nav_fingerprints_seen:
-                                skip_nav = True
-                                stats["nav_fingerprint_cache_hits"] += 1
-                                print(f"[NAV CACHE HIT] Skipping nav/menu discovery for {url} (fingerprint={fingerprint[:10]})")
-                            else:
-                                nav_fingerprints_seen.add(fingerprint)
-
-                    nav_candidates: List[Candidate] = []
-                    if req.use_menu_discovery and depth <= req.menu_discovery_max_depth and not skip_nav:
-                        nav_candidates = await nav_hover_and_harvest(
-                            page, url,
-                            hover_wait_ms=req.nav_hover_wait_ms,
-                            max_items=req.max_nav_items_to_hover
-                        )
-                        stats["menus_interacted"] += 1
-                        stats["nav_links_found"] += len(nav_candidates)
-                        for c in nav_candidates:
-                            enqueue(c, depth + 1)
-
-                    click_candidates: List[Candidate] = []
-                    revealed_md = ""
-                    if req.use_click_discovery and depth <= req.click_discovery_max_depth:
-                        click_candidates, revealed_text = await click_expand_and_harvest(
-                            page, url,
-                            post_click_wait_ms=req.post_click_wait_ms,
-                            max_buttons=req.max_buttons_to_click,
-                            enable_navigation_detection=req.enable_navigation_click_discovery,
-                            max_navigation_clicks=req.max_navigation_clicks_per_page,
-                            navigation_timeout_ms=req.navigation_click_timeout_ms,
-                            skip_nav_region=skip_nav,
-                            stats=stats
-                        )
-                        stats["clicks_interacted"] += 1
-                        stats["click_links_found"] += len(click_candidates)
-                        stats["navigation_links_found"] += sum(
-                            1 for c in click_candidates
-                            if c.source in ("card_click_revealed", "nav_click_revealed", "popup_click_revealed")
-                        )
-                        for c in click_candidates:
-                            enqueue(c, depth + 1)
-                        if revealed_text and req.extract_click_revealed_content:
-                            revealed_md = f"\n\n---\n\n# Click-Revealed Content\n\n{revealed_text}"
-
-                    if req.hash_nav_discovery and depth <= req.click_discovery_max_depth:
-                        hash_candidates = await extract_hash_nav_candidates(
-                            page, url, post_click_wait_ms=req.post_click_wait_ms
-                        )
-                        stats["hash_links_found"] += len(hash_candidates)
-                        for c in hash_candidates:
-                            enqueue(c, depth + 1)
-
-                    for route in await intercept_spa_routes(page):
-                        if route and isinstance(route, str):
-                            enqueue(Candidate(
-                                url=urljoin(url, route), source="spa_routing", parent_url=url
-                            ), depth + 1)
-
-                    html = await page.content()
-                    for c in await harvest_visible_links(page, url, source="dom_post_interaction"):
-                        enqueue(c, depth + 1)
-                    for c in discover_route_patterns_from_html(html, url):
-                        enqueue(c, depth + 1)
-
-                    title = await page.title()
-                    raw_md = await asyncio.to_thread(_cpu_clean_html_to_markdown, html)
-                    if revealed_md:
-                        raw_md += revealed_md
-
-                    if req.enable_preprocessing:
-                        md_text, rep = await asyncio.to_thread(
-                            _cpu_preprocess_markdown, raw_md, title, url
-                        )
-                    else:
-                        md_text, rep = raw_md, {}
-
-                    low_qual, reason = is_low_quality_markdown(md_text, title, req.min_markdown_chars)
-                    if low_qual:
-                        info["status"] = f"skipped_{reason}"
-                        print(f"[SKIP] {url} -> {reason}")
-                        return
-
-                    content_sig = get_content_signature(md_text)
-                    if content_sig in JOBS[job_id]["content_signatures"]:
-                        info["status"] = "skipped_duplicate_content"
-                        stats["skipped_duplicates"] += 1
-                        print(f"[SKIP DUPLICATE] {url}")
-                        return
-                    JOBS[job_id]["content_signatures"].add(content_sig)
-
-                    content_hash = hashlib.sha256(md_text.encode("utf-8")).hexdigest()
-
-                    success, status_code, resp_body = await send_page_to_saas_backend(
-                        client=client,
-                        semaphore=semaphore,
-                        tenant_id=req.tenant_id,
-                        agent_id=req.agent_id,
-                        url=url,
-                        title=title,
-                        markdown=md_text,
-                        content_hash=content_hash,
-                        depth=depth,
-                        score=info["score"],
-                        source=info["source"],
-                        preprocessing_report=rep
-                    )
-
-                    if success:
-                        stats["sent_pages"] += 1
-                        info["status"] = "completed"
-                    else:
-                        stats["failed_sends"] += 1
-                        info["status"] = "failed_send"
-                        stats["last_error"] = f"Backend HTTP {status_code}: {resp_body[:300]}"
-                        print(f"[SEND FAILED] {url} -> status {status_code}")
-
-                except Exception as e:
-                    print(f"[PAGE ERROR] {url}: {e}")
-                    info["status"] = "failed"
-                    stats["last_error"] = str(e)
+                            
+                            try:
+                                await process_page(worker_id, ctx, url, http_client, send_semaphore)
+                            except Exception as page_err:
+                                err_msg = str(page_err)
+                                is_closed_err = any(phrase in err_msg for phrase in (
+                                    "Target page, context or browser has been closed",
+                                    "has been closed",
+                                    "BrowserContext.new_page",
+                                    "Page.goto",
+                                    "Browser context closed"
+                                ))
+                                if is_closed_err:
+                                    print(f"[PAGE ERROR] [{job_id}] [worker-{worker_id}]: {url} -> closed context/browser error: {err_msg}. Recreating worker context...")
+                                    try:
+                                        await create_ctx()
+                                    except Exception as rec_err:
+                                        print(f"[PAGE ERROR] [{job_id}] [worker-{worker_id}]: Context recreation failed: {rec_err}")
+                            finally:
+                                queue.task_done()
+                                
+                        except asyncio.CancelledError:
+                            break
+                        except Exception as loop_err:
+                            print(f"[WORKER ERR] [{job_id}] [worker-{worker_id}]: {loop_err}")
                 finally:
                     try:
-                        await page.close()
+                        await ctx.close()
                     except Exception:
                         pass
-                    JOBS[job_id]["discovered_urls"] = len(discovered)
-                    JOBS[job_id].update(stats)
 
-            workers = [asyncio.create_task(worker()) for _ in range(req.concurrent_workers)]
+            workers = [asyncio.create_task(worker(i)) for i in range(req.concurrent_workers)]
             await queue.join()
             for w in workers:
                 w.cancel()
 
-            await context.close()
             await browser.close()
 
     if abort_crawling or JOBS[job_id].get("status") == "FAILED":
@@ -1390,7 +1496,7 @@ async def run_recursive_crawl(req: CrawlRequest, job_id: str):
         status = "COMPLETED"
 
     update_crawl_job_status(job_id, status, completed_at=utc_now(), **stats)
-    print(f"\n[DONE] Job {job_id}: status={status}, sent={stats['sent_pages']}, failed={stats['failed_sends']}")
+    print(f"\n[DONE] {job_id}, {status}, {stats['crawled_pages']}, {stats['sent_pages']}, {stats['failed_sends']}, {stats['rejected_urls']}, {stats['skipped_duplicates']}, {len(discovered)}, {stats.get('page_errors', 0)}")
 
 
 # ---------------------------------------------------------------------------
@@ -1424,7 +1530,8 @@ async def start_crawl_job(request: CrawlRequest, background_tasks: BackgroundTas
         "last_error": None,
         "content_signatures": set(),
         "restore_via_back": 0,
-        "restore_via_goto": 0
+        "restore_via_goto": 0,
+        "page_errors": 0
     }
 
     background_tasks.add_task(run_recursive_crawl, request, job_id)
