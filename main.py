@@ -129,8 +129,10 @@ def clean_and_normalize_url(url_str: str) -> str:
     parsed = urlparse(url_str)
     if parsed.scheme not in ("http", "https"): return ""
 
-    scheme = "https"
     netloc = parsed.netloc.lower()
+    scheme = parsed.scheme
+    if not any(lh in netloc for lh in ("localhost", "127.0.0.1", "0.0.0.0")):
+        scheme = "https"
     if netloc.startswith("www."):
         netloc = netloc[4:]
 
@@ -728,7 +730,8 @@ async def click_expand_and_harvest(page: Page, current_url: str,
                                     enable_navigation_detection: bool,
                                     max_navigation_clicks: int,
                                     navigation_timeout_ms: int,
-                                    skip_nav_region: bool = False) -> Tuple[List[Candidate], str]:
+                                    skip_nav_region: bool = False,
+                                    stats: dict = None) -> Tuple[List[Candidate], str]:
     """
     Strategy 2 – Clickable cards, accordions, "View Details", nav items with
     placeholder hrefs, tabs: click every interactive element, and for each
@@ -829,6 +832,8 @@ async def click_expand_and_harvest(page: Page, current_url: str,
                             if clean_and_normalize_url(page.url) == clean_and_normalize_url(current_url):
                                 await page.wait_for_timeout(min(post_click_wait_ms, 600))
                                 restore_success = True
+                                if stats is not None:
+                                    stats["restore_via_back"] = stats.get("restore_via_back", 0) + 1
                         except Exception:
                             pass
 
@@ -838,6 +843,8 @@ async def click_expand_and_harvest(page: Page, current_url: str,
                                 await page.goto(current_url, wait_until="domcontentloaded",
                                                  timeout=max(navigation_timeout_ms, 8000))
                                 await page.wait_for_timeout(min(post_click_wait_ms, 800))
+                                if stats is not None:
+                                    stats["restore_via_goto"] = stats.get("restore_via_goto", 0) + 1
                             except Exception as restore_err:
                                 print(f"  [RESTORE FAILED] {current_url}: {restore_err}")
                                 break  # can't keep iterating safely on this page
@@ -1097,7 +1104,9 @@ async def run_recursive_crawl(req: CrawlRequest, job_id: str):
         "hash_links_found": 0,
         "navigation_links_found": 0,
         "onclick_links_found": 0,
-        "nav_fingerprint_cache_hits": 0
+        "nav_fingerprint_cache_hits": 0,
+        "restore_via_back": 0,
+        "restore_via_goto": 0
     }
     nav_fingerprints_seen: set = set()
 
@@ -1270,7 +1279,8 @@ async def run_recursive_crawl(req: CrawlRequest, job_id: str):
                             enable_navigation_detection=req.enable_navigation_click_discovery,
                             max_navigation_clicks=req.max_navigation_clicks_per_page,
                             navigation_timeout_ms=req.navigation_click_timeout_ms,
-                            skip_nav_region=skip_nav
+                            skip_nav_region=skip_nav,
+                            stats=stats
                         )
                         stats["clicks_interacted"] += 1
                         stats["click_links_found"] += len(click_candidates)
@@ -1415,7 +1425,9 @@ async def start_crawl_job(request: CrawlRequest, background_tasks: BackgroundTas
         "skipped_duplicates": 0,
         "current_url": "",
         "last_error": None,
-        "content_signatures": set()
+        "content_signatures": set(),
+        "restore_via_back": 0,
+        "restore_via_goto": 0
     }
 
     background_tasks.add_task(run_recursive_crawl, request, job_id)
