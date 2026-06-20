@@ -834,9 +834,9 @@ async def click_expand_and_harvest(page: Page, current_url: str,
 
                         if not restore_success:
                             try:
-                                # Fallback to full reload with a higher timeout
+                                # Fallback to full reload with a shorter fallback timeout
                                 await page.goto(current_url, wait_until="domcontentloaded",
-                                                 timeout=max(navigation_timeout_ms, 25000))
+                                                 timeout=max(navigation_timeout_ms, 8000))
                                 await page.wait_for_timeout(min(post_click_wait_ms, 800))
                             except Exception as restore_err:
                                 print(f"  [RESTORE FAILED] {current_url}: {restore_err}")
