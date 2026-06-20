@@ -1185,17 +1185,14 @@ async def run_recursive_crawl(req: CrawlRequest, job_id: str):
             async def worker():
                 nonlocal abort_crawling
                 while True:
-                    if abort_crawling:
-                        break
-
-                    total_attempts = stats["sent_pages"] + stats["failed_sends"]
-                    if total_attempts >= MIN_SEND_ATTEMPTS_BEFORE_ABORT:
-                        failure_rate = stats["failed_sends"] / total_attempts
-                        if failure_rate > MAX_BACKEND_FAILURE_RATE:
-                            stats["last_error"] = f"Aborted: Backend failure rate {failure_rate:.1%} exceeded threshold of {MAX_BACKEND_FAILURE_RATE:.1%}."
-                            abort_crawling = True
-                            update_crawl_job_status(job_id, "FAILED", **stats)
-                            break
+                    if not abort_crawling:
+                        total_attempts = stats["sent_pages"] + stats["failed_sends"]
+                        if total_attempts >= MIN_SEND_ATTEMPTS_BEFORE_ABORT:
+                            failure_rate = stats["failed_sends"] / total_attempts
+                            if failure_rate > MAX_BACKEND_FAILURE_RATE:
+                                stats["last_error"] = f"Aborted: Backend failure rate {failure_rate:.1%} exceeded threshold of {MAX_BACKEND_FAILURE_RATE:.1%}."
+                                abort_crawling = True
+                                update_crawl_job_status(job_id, "FAILED", **stats)
 
                     try:
                         score_inv, _, url = await queue.get()
