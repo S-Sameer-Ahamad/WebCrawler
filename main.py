@@ -93,6 +93,10 @@ class CrawlRequest(BaseModel):
     max_navigation_clicks_per_page: int = Field(default=60, ge=0, le=300)
     navigation_click_timeout_ms: int = Field(default=6000, ge=1000, le=20000)
 
+    # NEW: speed optimizations that don't reduce coverage.
+    enable_nav_fingerprint_cache: bool = True
+    block_tracking_scripts: bool = True
+
 
 class Candidate(BaseModel):
     url: str
@@ -723,7 +727,8 @@ async def click_expand_and_harvest(page: Page, current_url: str,
                                     max_buttons: int,
                                     enable_navigation_detection: bool,
                                     max_navigation_clicks: int,
-                                    navigation_timeout_ms: int) -> Tuple[List[Candidate], str]:
+                                    navigation_timeout_ms: int,
+                                    skip_nav_region: bool = False) -> Tuple[List[Candidate], str]:
     """
     Strategy 2 – Clickable cards, accordions, "View Details", nav items with
     placeholder hrefs, tabs: click every interactive element, and for each
@@ -785,6 +790,14 @@ async def click_expand_and_harvest(page: Page, current_url: str,
             try:
                 el = clickable.nth(i)
                 if not await el.is_visible(): continue
+
+                if skip_nav_region:
+                    try:
+                        in_nav_region = await el.evaluate("e => !!e.closest('nav, header, footer')")
+                    except Exception:
+                        in_nav_region = False
+                    if in_nav_region:
+                        continue
 
                 el_text = (await el.inner_text()).strip().lower()[:120]
                 el_label = (await el.get_attribute("aria-label") or "").lower()[:80]
@@ -935,6 +948,48 @@ async def extract_hash_nav_candidates(page: Page, current_url: str,
     return candidates
 
 
+TRACKING_DOMAINS = (
+    "google-analytics.com", "googletagmanager.com", "doubleclick.net",
+    "googlesyndication.com", "googleadservices.com", "adservice.google.com",
+    "facebook.net", "connect.facebook.net", "facebook.com/tr",
+    "hotjar.com", "clarity.ms", "segment.com", "segment.io",
+    "mixpanel.com", "intercom.io", "widget.intercom.io",
+    "hs-scripts.com", "hs-analytics.net", "hubspot.com",
+    "crisp.chat", "tawk.to", "amazon-adsystem.com",
+    "criteo.com", "taboola.com", "outbrain.com", "bing.com/bat",
+    "linkedin.com/px", "snapchat.com", "tiktok.com/i18n",
+    "newrelic.com", "nr-data.net", "sentry.io", "bugsnag.com"
+)
+
+
+def is_tracking_request(request_url: str) -> bool:
+    url_lower = request_url.lower()
+    return any(domain in url_lower for domain in TRACKING_DOMAINS)
+
+
+async def compute_nav_fingerprint(page: Page) -> str:
+    """
+    Hashes the nav/header/footer region's structural HTML. On most sites
+    this is byte-identical across every page, so once we've fully
+    hover/click-discovered it once, we can recognize it again instantly and
+    skip re-doing that (expensive, redundant) work on every later page —
+    without ever skipping page-specific content elements.
+    """
+    try:
+        regions = await page.evaluate("""() => {
+            const sel = ['nav', 'header', 'footer'];
+            return sel.map(s => {
+                const el = document.querySelector(s);
+                return el ? el.outerHTML.replace(/\\s+/g, ' ').trim() : '';
+            }).join('|');
+        }""")
+        if not regions or len(regions) < 20:
+            return ""
+        return hashlib.sha256(regions.encode("utf-8", errors="ignore")).hexdigest()
+    except Exception:
+        return ""
+
+
 async def intercept_spa_routes(page: Page) -> List[str]:
     """Pull any SPA pushState/replaceState routes captured by init script."""
     try:
@@ -1041,8 +1096,10 @@ async def run_recursive_crawl(req: CrawlRequest, job_id: str):
         "click_links_found": 0,
         "hash_links_found": 0,
         "navigation_links_found": 0,
-        "onclick_links_found": 0
+        "onclick_links_found": 0,
+        "nav_fingerprint_cache_hits": 0
     }
+    nav_fingerprints_seen: set = set()
 
     def enqueue(cand: Candidate, depth: int):
         nonlocal counter
@@ -1103,12 +1160,17 @@ async def run_recursive_crawl(req: CrawlRequest, job_id: str):
                 });
             """)
 
-            if req.block_heavy_resources:
+            if req.block_heavy_resources or req.block_tracking_scripts:
+                def _should_abort(route_request) -> bool:
+                    if req.block_heavy_resources and route_request.resource_type in {"image", "media", "font", "stylesheet"}:
+                        return True
+                    if req.block_tracking_scripts and is_tracking_request(route_request.url):
+                        return True
+                    return False
+
                 await context.route(
                     "**/*",
-                    lambda r: r.abort()
-                    if r.request.resource_type in {"image", "media", "font", "stylesheet"}
-                    else r.continue_()
+                    lambda r: r.abort() if _should_abort(r.request) else r.continue_()
                 )
 
             async def worker():
@@ -1175,8 +1237,19 @@ async def run_recursive_crawl(req: CrawlRequest, job_id: str):
                     for c in onclick_candidates:
                         enqueue(c, depth + 1)
 
+                    skip_nav = False
+                    if req.enable_nav_fingerprint_cache:
+                        fingerprint = await compute_nav_fingerprint(page)
+                        if fingerprint:
+                            if fingerprint in nav_fingerprints_seen:
+                                skip_nav = True
+                                stats["nav_fingerprint_cache_hits"] += 1
+                                print(f"[NAV CACHE HIT] Skipping nav/menu discovery for {url} (fingerprint={fingerprint[:10]})")
+                            else:
+                                nav_fingerprints_seen.add(fingerprint)
+
                     nav_candidates: List[Candidate] = []
-                    if req.use_menu_discovery and depth <= req.menu_discovery_max_depth:
+                    if req.use_menu_discovery and depth <= req.menu_discovery_max_depth and not skip_nav:
                         nav_candidates = await nav_hover_and_harvest(
                             page, url,
                             hover_wait_ms=req.nav_hover_wait_ms,
@@ -1196,7 +1269,8 @@ async def run_recursive_crawl(req: CrawlRequest, job_id: str):
                             max_buttons=req.max_buttons_to_click,
                             enable_navigation_detection=req.enable_navigation_click_discovery,
                             max_navigation_clicks=req.max_navigation_clicks_per_page,
-                            navigation_timeout_ms=req.navigation_click_timeout_ms
+                            navigation_timeout_ms=req.navigation_click_timeout_ms,
+                            skip_nav_region=skip_nav
                         )
                         stats["clicks_interacted"] += 1
                         stats["click_links_found"] += len(click_candidates)
