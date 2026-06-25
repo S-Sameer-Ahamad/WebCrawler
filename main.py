@@ -320,27 +320,83 @@ def should_reject_url(url: str, root_domain: str, follow_query_urls: bool,
 # ---------------------------------------------------------------------------
 
 DETAIL_PATTERNS: List[Tuple[re.Pattern, str]] = [
-    (re.compile(r"/(blog|article|articles|news|post|posts|stories|insights|resources|guides|whitepapers|case-studies?|press-releases?|announcements?)/[^/]+", re.I), "blog_detail"),
+    # Blog / article / news detail pages
+    (re.compile(r"/(blog|article|articles|news|post|posts|stories|insights|resources|guides|whitepapers|press-releases?|announcements?)/[^/]+", re.I), "blog_detail"),
     (re.compile(r"/(blog-details?|article-details?|news-details?|post-details?|story-details?)/[^/]+", re.I), "blog_detail"),
-    (re.compile(r"/(jobs?|career|careers|positions?|openings?|vacancies?)/[^/]+", re.I), "job_detail"),
-    (re.compile(r"/(career-details?|job-details?)/[^/]+", re.I), "job_detail"),
-    (re.compile(r"/(services?|service-details?|solutions?|offerings?|products?|capabilities)/[^/]+", re.I), "service_detail"),
-    (re.compile(r"/(portfolio|case-studies?|projects?|work|our-work)/[^/]+", re.I), "portfolio_detail"),
+    # Job / career detail pages
+    (re.compile(r"/(career-details?|job-details?|opening-details?|vacancy-details?)/[^/]+", re.I), "job_detail"),
+    (re.compile(r"/(jobs?|career|careers|positions?|openings?|vacancies?|vacancy|job-openings?)/[^/]+", re.I), "job_detail"),
+    # Service / solution / product detail pages
+    (re.compile(r"/(service-details?|solution-details?|product-details?)/[^/]+", re.I), "service_detail"),
+    (re.compile(r"/(services?|solutions?|offerings?|products?|capabilities)/[^/]+", re.I), "service_detail"),
+    # Portfolio / case study / success story detail pages
+    (re.compile(r"/(portfolio|case-studies?|case-study|projects?|work|our-work)/[^/]+", re.I), "portfolio_detail"),
+    (re.compile(r"/(success-stories?|success-story)/[^/]+", re.I), "portfolio_detail"),
+    # Team / people detail pages
     (re.compile(r"/(team|people|about/team|our-team)/[^/]+", re.I), "team_detail"),
+    # Event / webinar detail pages
     (re.compile(r"/(events?|webinars?|workshops?)/[^/]+", re.I), "event_detail"),
+    # Docs / support detail pages
     (re.compile(r"/(docs?|documentation|help|support|knowledge-?base|faq)/[^/]+", re.I), "doc_detail"),
 ]
 
 LISTING_PATTERNS: List[Tuple[re.Pattern, str]] = [
     (re.compile(r"^/(blog|articles?|news|posts?|insights?|resources?)/?$", re.I), "blog_listing"),
-    (re.compile(r"^/(jobs?|careers?|openings?|positions?)/?$", re.I), "job_listing"),
+    (re.compile(r"^/(jobs?|careers?|openings?|positions?|vacancies?|job-openings?)/?$", re.I), "job_listing"),
     (re.compile(r"^/(services?|solutions?|products?|offerings?)/?$", re.I), "service_listing"),
-    (re.compile(r"^/(portfolio|case-studies?|projects?|work)/?$", re.I), "portfolio_listing"),
+    (re.compile(r"^/(portfolio|case-studies?|case-study|projects?|work)/?$", re.I), "portfolio_listing"),
+    (re.compile(r"^/(success-stories?|success-story)/?$", re.I), "portfolio_listing"),
     (re.compile(r"^/(team|people|our-team)/?$", re.I), "team_listing"),
     (re.compile(r"^/(about|about-us)/?$", re.I), "about"),
     (re.compile(r"^/(contact|contact-us|get-in-touch|reach-us)/?$", re.I), "contact"),
-    (re.compile(r"^/(privacy|privacy-policy|terms|terms-of-service|terms-and-conditions|cookie-policy)/?$", re.I), "legal"),
+    (re.compile(r"^/(privacy|privacy-policy|terms|terms-of-service|terms-and-conditions|cookie-policy|terms-condition)/?$", re.I), "legal"),
 ]
+
+# Patterns whose paths look like listing/parent routes but are used as canonical
+# for all their child detail pages (a common CMS anti-pattern).
+# Used by DedupStore to ignore misleading canonical tags on detail pages.
+_GENERIC_PARENT_PATHS: re.Pattern = re.compile(
+    r"^/("
+    r"blog-details?|article-details?|news-details?|post-details?|story-details?|"
+    r"service-details?|solution-details?|product-details?|"
+    r"career-details?|job-details?|opening-details?|vacancy-details?|"
+    r"blog|blogs|article|articles|news|posts?|insights?|resources?|"
+    r"services?|solutions?|products?|offerings?|"
+    r"careers?|jobs?|openings?|vacancies?|job-openings?|"
+    r"portfolio|case-studies?|success-stories?|projects?|work"
+    r")/?$",
+    re.I,
+)
+
+
+def is_generic_parent_canonical(current_url: str, canonical_url: str) -> bool:
+    """
+    Returns True when the canonical URL is a generic listing/parent route
+    and the current URL is a detail page under it.
+
+    Example: current=/blog-details/my-slug, canonical=/blog-details  -> True
+    Example: current=/blog-details/my-slug, canonical=/blog-details/my-slug -> False
+    Example: current=/about, canonical=/about -> False (same page)
+
+    When True the caller should IGNORE the canonical for dedup purposes and
+    log [CANONICAL IGNORED] reason=generic_parent_canonical.
+    """
+    try:
+        cur_path = urlparse(current_url).path.rstrip("/") or "/"
+        can_path = urlparse(canonical_url).path.rstrip("/") or "/"
+    except Exception:
+        return False
+
+    # Same path — canonical is fine, don't ignore.
+    if cur_path.lower() == can_path.lower():
+        return False
+
+    # Canonical must match a known listing/parent pattern.
+    if not _GENERIC_PARENT_PATHS.match(can_path):
+        return False
+
+    # Current URL must start with the canonical path (child of it).
+    return cur_path.lower().startswith(can_path.lower() + "/")
 
 
 def classify_route(url: str) -> str:
@@ -795,6 +851,22 @@ def _cpu_preprocess_markdown(text: str, title: str, url: str) -> Tuple[str, Dict
 # Quality check (route-type aware)
 # ---------------------------------------------------------------------------
 
+# Keywords present in a job/career detail page body that justify accepting
+# shorter content (job ads are often concise lists, not long prose).
+_JOB_CONTENT_KEYWORDS = (
+    "experience", "responsibilities", "requirements", "qualifications",
+    "skills", "location", "employment type", "job description", "apply",
+    "role", "position", "vacancy", "opening", "salary", "compensation",
+    "benefits", "contract", "permanent", "full-time", "part-time",
+)
+
+
+def _has_job_content(text: str) -> bool:
+    """Returns True if the page body contains recognisable job-detail fields."""
+    lower = text.lower()
+    return sum(1 for kw in _JOB_CONTENT_KEYWORDS if kw in lower) >= 2
+
+
 def is_low_quality_markdown(
     md_text: str,
     title: str,
@@ -818,7 +890,13 @@ def is_low_quality_markdown(
         return True, "bad_phrase"
 
     if is_detail_page(route_type):
-        if main_content_chars < min_detail_body_chars:
+        # Job/career pages are often concise; allow shorter content when
+        # recognisable job-detail fields are present.
+        if route_type == "job_detail" and _has_job_content(lower):
+            effective_min = min(min_detail_body_chars, 400)
+        else:
+            effective_min = min_detail_body_chars
+        if main_content_chars < effective_min:
             return True, f"detail_body_too_short:{main_content_chars}"
     else:
         if len(text) < min_chars:
@@ -856,26 +934,45 @@ class DedupStore:
         canonical_url: str,
     ) -> Tuple[bool, str]:
         async with self._lock:
-            # Canonical URL dedup
+            norm_cur = clean_and_normalize_url(url)
+
+            # ----------------------------------------------------------------
+            # Canonical URL dedup — but NEVER use a generic parent canonical
+            # as evidence of a duplicate on a detail page.
+            # e.g. canonical=/blog-details for url=/blog-details/my-slug
+            # ----------------------------------------------------------------
+            canonical_used = False
             if canonical_url:
                 norm_can = clean_and_normalize_url(canonical_url)
-                norm_cur = clean_and_normalize_url(url)
-                if norm_can and norm_can != norm_cur and norm_can in self._canonicals:
-                    return True, f"duplicate_canonical:{norm_can}"
-                if norm_can:
-                    self._canonicals.add(norm_can)
-            self._canonicals.add(clean_and_normalize_url(url))
 
+                if norm_can and is_generic_parent_canonical(url, canonical_url):
+                    # Canonical points to the listing parent, not this page.
+                    # Log and ignore it — do NOT store it as a seen canonical.
+                    print(
+                        f"[CANONICAL IGNORED] reason=generic_parent_canonical "
+                        f"url={url} canonical={canonical_url}"
+                    )
+                elif norm_can and norm_can != norm_cur:
+                    if norm_can in self._canonicals:
+                        return True, f"duplicate_canonical:{norm_can}"
+                    self._canonicals.add(norm_can)
+                    canonical_used = True
+
+            self._canonicals.add(norm_cur)
+
+            # ----------------------------------------------------------------
             # Content signature dedup
+            # ----------------------------------------------------------------
             current_meta = f"{(title or '').strip().lower()}|{(h1 or '').strip().lower()}"
             if content_sig in self._sigs:
                 original_url = self._sigs[content_sig]
                 if is_detail_page(route_type):
-                    # For detail pages: only skip if title+h1 also match
+                    # For detail pages: only skip if title+h1 ALSO match.
+                    # Different slug / title = different article sharing same
+                    # nav chrome = keep it.
                     original_meta = self._sig_meta.get(content_sig, "")
                     if original_meta and original_meta == current_meta:
                         return True, f"duplicate_content_and_title:{original_url}"
-                    # Different title = different article sharing same template section = keep it
                     return False, "ok"
                 else:
                     return True, f"duplicate_content:{original_url}"
