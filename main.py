@@ -1928,7 +1928,6 @@ async def run_recursive_crawl(req: CrawlRequest, job_id: str):
                             _, _, url = await asyncio.wait_for(queue.get(), timeout=5.0)
                         except asyncio.TimeoutError:
                             # Queue empty — worker idles; queue.join() will resolve
-                            queue.task_done()
                             continue
                         except asyncio.CancelledError:
                             break
@@ -1937,7 +1936,6 @@ async def run_recursive_crawl(req: CrawlRequest, job_id: str):
                             async with enqueue_lock:
                                 over_limit = stats["crawled_pages"] >= req.max_pages
                             if over_limit or abort_crawling:
-                                queue.task_done()
                                 continue
 
                             async with enqueue_lock:
