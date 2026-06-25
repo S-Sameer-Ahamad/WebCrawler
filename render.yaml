@@ -6,7 +6,7 @@ services:
     healthCheckPath: /health
     envVars:
       - key: SAAS_BACKEND_URL
-        value: https://nexora-api-ngnu.onrender.com
+        sync: false
       - key: CRAWLER_INTERNAL_TOKEN
         sync: false
       - key: CRAWLER_API_TOKEN
