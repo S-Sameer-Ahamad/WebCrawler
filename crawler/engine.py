@@ -83,6 +83,7 @@ class CrawlEngine:
                 "onclick_links_found": 0, "nav_fingerprint_cache_hits": 0,
                 "restore_via_back": 0, "restore_via_goto": 0, "page_errors": 0,
                 "route_type_counts": {},
+                "estimated_seconds_remaining": None,
             }
             for k, v in defaults.items():
                 job.setdefault(k, v)
@@ -98,7 +99,12 @@ class CrawlEngine:
                 "onclick_links_found": 0, "nav_fingerprint_cache_hits": 0,
                 "restore_via_back": 0, "restore_via_goto": 0, "page_errors": 0,
                 "route_type_counts": {},
+                "estimated_seconds_remaining": None,
             }
+
+        # ETA tracking: timestamps of last N page completions for rolling avg
+        self._page_times: list[float] = []  # monotonic timestamps
+        self._t_start: Optional[float] = None
 
         self._nav_fingerprints_seen: Set[str] = set()
         self._dedup = DedupStore()
@@ -179,6 +185,7 @@ class CrawlEngine:
                         info["decision"] = "PAGE_ERROR"
                         info["reason"] = f"http_{resp.status}"
                         logger.warning("page_http_error", url=url, status=resp.status)
+                        self._update_eta()
                         return
                     load_ok = True
                     break
@@ -193,6 +200,7 @@ class CrawlEngine:
                     raise
 
             if not load_ok:
+                self._update_eta()
                 return
 
             # Network idle
@@ -339,6 +347,7 @@ class CrawlEngine:
                 info["reason"] = lq_reason
                 logger.info("skip_low_quality", url=url, route=route_type,
                            title=title[:60], reason=lq_reason)
+                self._update_eta()
                 return
 
             # 9. Dedup
@@ -353,6 +362,7 @@ class CrawlEngine:
                 async with self._enqueue_lock:
                     self.stats["skipped_duplicates"] += 1
                 logger.info("skip_duplicate", url=url, route=route_type, reason=dup_reason)
+                self._update_eta()
                 return
 
             # 10. Send to backend
@@ -385,6 +395,7 @@ class CrawlEngine:
             if success:
                 async with self._enqueue_lock:
                     self.stats["sent_pages"] += 1
+                    self._update_eta()
                 info["status"] = "completed"
                 info["decision"] = "SEND"
                 info["reason"] = "ok"
@@ -404,6 +415,7 @@ class CrawlEngine:
                 async with self._enqueue_lock:
                     self.stats["failed_sends"] += 1
                     self.stats["last_error"] = f"HTTP {status_code}: {resp_body[:200]}"
+                    self._update_eta()
                 info["status"] = "failed_send"
                 info["decision"] = "SEND"
                 info["reason"] = f"backend_error_{status_code}"
@@ -431,16 +443,63 @@ class CrawlEngine:
             ))
             if is_ctx_closed:
                 raise
+            self._update_eta()
         finally:
             try:
                 await page.close()
             except Exception:
                 pass
 
+    # --- ETA calculation ---
+
+    def _update_eta(self) -> None:
+        """Update estimated_seconds_remaining based on rolling window page rate."""
+        now = time.monotonic()
+        self._page_times.append(now)
+        # Keep last 60s window (drop stale entries)
+        cutoff = now - 60.0
+        self._page_times = [t for t in self._page_times if t >= cutoff]
+
+        crawled = max(self.stats["crawled_pages"], 1)
+        queue_size = self.queue.qsize()
+        max_pages = self.req.max_pages
+
+        # Pages remaining: either queue + room-to-max, or just discovered remaining
+        remaining = queue_size + max(0, max_pages - crawled)
+        remaining = max(remaining, 0)
+
+        if remaining == 0 or self._t_start is None:
+            self.stats["estimated_seconds_remaining"] = 0
+            return
+
+        # Rolling window: pages in last 60s / 60s = pages per second
+        recent_count = len(self._page_times)
+        elapsed_total = now - self._t_start
+
+        if recent_count >= 3 and elapsed_total > 10:
+            # Use rolling window rate when we have enough recent data
+            window_span = self._page_times[-1] - self._page_times[0]
+            rate = recent_count / max(window_span, 1.0)
+        else:
+            # Fall back to overall rate
+            rate = crawled / max(elapsed_total, 1.0)
+
+        rate = max(rate, 0.01)  # floor to avoid division by zero / infinite ETA
+        eta = remaining / rate
+
+        # Apply a safety factor: real crawls slow down as they exhaust discovery pages
+        if crawled > 10 and queue_size < 20:
+            eta *= 0.7  # winding down — ETA overestimates
+        elif crawled < 5:
+            eta *= 1.5  # early phase — slow discovery pages skew rate
+
+        self.stats["estimated_seconds_remaining"] = int(eta)
+
     # --- Main run loop ---
 
     async def run(self) -> Dict[str, Any]:
-        t_start = time.monotonic()
+        self._t_start = time.monotonic()
+        t_start = self._t_start
 
         # Initial enqueue
         await self.enqueue(Candidate(url=self.start_url, source="start", parent_url=self.start_url), 0)

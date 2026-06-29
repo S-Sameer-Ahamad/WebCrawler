@@ -89,6 +89,7 @@ class JobStatusResponse(BaseModel):
     discovered_urls: int = 0
     completed_at: Optional[str] = None
     elapsed_seconds: Optional[int] = None
+    estimated_seconds_remaining: Optional[int] = None
     route_type_counts: dict[str, int] = {}
     page_errors: int = 0
 

@@ -154,6 +154,16 @@ async def get_status(job_id: str):
     # Include discovered count
     pages = PAGES.get(job_id, {})
     job["discovered_urls"] = len(pages)
+
+    # Compute elapsed on-the-fly (only set at completion in the dict)
+    if job.get("elapsed_seconds") is None and job.get("created_at"):
+        try:
+            from datetime import datetime, timezone
+            created = datetime.fromisoformat(job["created_at"])
+            job["elapsed_seconds"] = int((datetime.now(timezone.utc) - created).total_seconds())
+        except Exception:
+            pass
+
     return JobStatusResponse(**job)
 
 
