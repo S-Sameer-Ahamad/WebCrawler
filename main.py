@@ -15,10 +15,15 @@ _PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
-from dotenv import load_dotenv
-
-# Load .env first, before any other config reads
-load_dotenv(os.path.join(_PROJECT_ROOT, ".env"))
+# Load .env — no external dependency needed
+_env_path = os.path.join(_PROJECT_ROOT, ".env")
+if os.path.isfile(_env_path):
+    with open(_env_path, "r", encoding="utf-8") as _f:
+        for _line in _f:
+            _line = _line.strip()
+            if _line and not _line.startswith("#") and "=" in _line:
+                _key, _, _val = _line.partition("=")
+                os.environ.setdefault(_key.strip(), _val.strip().strip('"').strip("'"))
 
 # Windows Proactor is required for asyncio subprocess support (Playwright)
 if sys.platform.startswith("win"):
