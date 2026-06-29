@@ -118,6 +118,8 @@ async def start_crawl_job(request: CrawlRequest, background_tasks: BackgroundTas
         "current_url": "", "last_error": None,
         "restore_via_back": 0, "restore_via_goto": 0, "page_errors": 0,
         "route_type_counts": {},
+        "finished_pages": 0,
+        "max_pages": request.max_pages,
     }
     PAGES[job_id] = {}
 
@@ -148,23 +150,53 @@ async def start_crawl_job(request: CrawlRequest, background_tasks: BackgroundTas
     summary="Get crawl job status",
 )
 async def get_status(job_id: str):
-    if job_id not in JOBS:
+    try:
+        if not job_id or job_id not in JOBS:
+            raise HTTPException(status_code=404, detail="Job not found")
+        job = JOBS[job_id]
+        
+        # Include discovered count
+        pages = PAGES.get(job_id, {})
+        job["discovered_urls"] = len(pages)
+
+        # Compute elapsed on-the-fly (only set at completion in the dict)
+        if job.get("elapsed_seconds") is None and job.get("created_at"):
+            try:
+                from datetime import datetime, timezone
+                created = datetime.fromisoformat(job["created_at"])
+                job["elapsed_seconds"] = int((datetime.now(timezone.utc) - created).total_seconds())
+            except Exception:
+                pass
+
+        # Calculate estimated_seconds_remaining dynamically
+        finished = job.get("finished_pages", 0)
+        status = job.get("status")
+
+        if finished < 1 or status == "QUEUED":
+            job["estimated_seconds_remaining"] = None
+        elif status in ("COMPLETED", "FAILED", "COMPLETED_WITH_ERRORS"):
+            job["estimated_seconds_remaining"] = 0
+        else:
+            try:
+                from datetime import datetime, timezone
+                created = datetime.fromisoformat(job["created_at"])
+                elapsed = (datetime.now(timezone.utc) - created).total_seconds()
+                
+                avg_seconds = elapsed / finished
+                crawled = job.get("crawled_pages", 0)
+                max_pages = job.get("max_pages", 300)
+                remaining = max(0, max_pages - crawled)
+                
+                job["estimated_seconds_remaining"] = int(avg_seconds * remaining)
+            except Exception:
+                job["estimated_seconds_remaining"] = None
+
+        return JobStatusResponse(**job)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("get_status_error", job_id=job_id, error=str(e))
         raise HTTPException(status_code=404, detail="Job not found")
-    job = JOBS[job_id]
-    # Include discovered count
-    pages = PAGES.get(job_id, {})
-    job["discovered_urls"] = len(pages)
-
-    # Compute elapsed on-the-fly (only set at completion in the dict)
-    if job.get("elapsed_seconds") is None and job.get("created_at"):
-        try:
-            from datetime import datetime, timezone
-            created = datetime.fromisoformat(job["created_at"])
-            job["elapsed_seconds"] = int((datetime.now(timezone.utc) - created).total_seconds())
-        except Exception:
-            pass
-
-    return JobStatusResponse(**job)
 
 
 @router.get(

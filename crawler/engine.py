@@ -84,6 +84,7 @@ class CrawlEngine:
                 "restore_via_back": 0, "restore_via_goto": 0, "page_errors": 0,
                 "route_type_counts": {},
                 "estimated_seconds_remaining": None,
+                "finished_pages": 0,
             }
             for k, v in defaults.items():
                 job.setdefault(k, v)
@@ -445,6 +446,8 @@ class CrawlEngine:
                 raise
             self._update_eta()
         finally:
+            async with self._enqueue_lock:
+                self.stats["finished_pages"] = self.stats.get("finished_pages", 0) + 1
             try:
                 await page.close()
             except Exception:
