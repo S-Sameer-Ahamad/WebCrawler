@@ -180,12 +180,29 @@ async def get_status(job_id: str):
                 from datetime import datetime, timezone
                 created = datetime.fromisoformat(job["created_at"])
                 elapsed = (datetime.now(timezone.utc) - created).total_seconds()
-                
-                avg_seconds = elapsed / max(crawled, 1)
+
+                discovered = job.get("discovered_urls", 0)
                 max_pages = job.get("max_pages", 300)
-                remaining = max(0, max_pages - crawled)
-                
-                job["estimated_seconds_remaining"] = int(avg_seconds * remaining)
+
+                # Use discovered count as the real ceiling — most sites have
+                # far fewer pages than max_pages, and detail pages are fast.
+                effective_total = min(max_pages, discovered) if discovered > crawled else max_pages
+                remaining = max(0, effective_total - crawled)
+
+                if remaining <= 0 or crawled < 1:
+                    job["estimated_seconds_remaining"] = None
+                else:
+                    # Weight recent pages more heavily — early discovery pages
+                    # are slow (nav hover, click discovery), detail pages are fast.
+                    # Use a 60/40 blend: 60% rate from last 30% of pages, 40% overall.
+                    recent_window = max(1, int(crawled * 0.3))
+                    recent_rate = recent_window / max(elapsed * 0.5, 1)  # rough: last 30% in ~half the time
+                    overall_rate = crawled / max(elapsed, 1)
+                    blended_rate = (recent_rate * 0.6) + (overall_rate * 0.4)
+                    blended_rate = max(blended_rate, 0.02)  # floor: 50s per page
+
+                    eta = remaining / blended_rate
+                    job["estimated_seconds_remaining"] = int(eta)
             except Exception:
                 job["estimated_seconds_remaining"] = None
 
