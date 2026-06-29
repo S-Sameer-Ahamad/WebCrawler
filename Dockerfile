@@ -7,6 +7,9 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Ensure Playwright browsers match the Python package (1.44.0)
+RUN playwright install chromium
+
 COPY . .
 RUN chown -R crawler:crawler /app
 
