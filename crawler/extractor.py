@@ -43,12 +43,13 @@ NOISE_SELECTORS = [
 
 
 class PageMeta:
-    __slots__ = ("title", "h1", "canonical_url", "meta_refresh_url",
+    __slots__ = ("title", "h1", "best_heading", "canonical_url", "meta_refresh_url",
                  "og_url", "json_ld_urls", "soup")
 
     def __init__(self):
         self.title: str = ""
         self.h1: str = ""
+        self.best_heading: str = ""  # Best available heading (h1 → h2.page_title → h3.post_title → first heading)
         self.canonical_url: str = ""
         self.meta_refresh_url: str = ""
         self.og_url: str = ""
@@ -74,6 +75,23 @@ def parse_page_meta(html: str, page_url: str) -> PageMeta:
 
         h1_tag = soup.find("h1")
         meta.h1 = h1_tag.get_text(strip=True)[:200] if h1_tag else ""
+
+        # Best heading — cascade from most specific to most generic.
+        # Many sites skip h1 and use h2/h3 with CSS classes for the page title.
+        # The <title> tag is often the same site-wide title for all pages.
+        heading_selectors = [
+            "h1",
+            "h2.page_title", "h2.details_item_title",
+            "h2[class*='title']", "h3.post_title", "h3[class*='title']",
+            "h2", "h3",
+        ]
+        for sel in heading_selectors:
+            el = soup.select_one(sel)
+            if el:
+                txt = el.get_text(strip=True)[:200]
+                if txt and len(txt) > 2:
+                    meta.best_heading = txt
+                    break
 
         canonical = soup.find("link", rel="canonical")
         if canonical and canonical.get("href"):

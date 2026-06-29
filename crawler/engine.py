@@ -303,9 +303,18 @@ class CrawlEngine:
             if page_meta.meta_refresh_url:
                 await self.enqueue(Candidate(url=page_meta.meta_refresh_url, source="meta_refresh", parent_url=url), depth + 1)
 
-            title = page_meta.title or (await page.title())
+            page_title = page_meta.title or (await page.title())
             h1 = page_meta.h1
             canonical_url = page_meta.canonical_url
+
+            # Use best_heading (h1 → h2.page_title → h3.post_title cascade)
+            # when available — far more specific than the site-wide <title> tag.
+            if page_meta.best_heading:
+                title = page_meta.best_heading
+            elif h1:
+                title = h1
+            else:
+                title = page_title
 
             # 7. Content extraction
             soup_to_use = page_meta.soup

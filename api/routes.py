@@ -118,7 +118,6 @@ async def start_crawl_job(request: CrawlRequest, background_tasks: BackgroundTas
         "current_url": "", "last_error": None,
         "restore_via_back": 0, "restore_via_goto": 0, "page_errors": 0,
         "route_type_counts": {},
-        "finished_pages": 0,
         "max_pages": request.max_pages,
     }
     PAGES[job_id] = {}
@@ -169,10 +168,10 @@ async def get_status(job_id: str):
                 pass
 
         # Calculate estimated_seconds_remaining dynamically
-        finished = job.get("finished_pages", 0)
+        crawled = job.get("crawled_pages", 0)
         status = job.get("status")
 
-        if finished < 1 or status == "QUEUED":
+        if crawled < 1 or status == "QUEUED":
             job["estimated_seconds_remaining"] = None
         elif status in ("COMPLETED", "FAILED", "COMPLETED_WITH_ERRORS"):
             job["estimated_seconds_remaining"] = 0
@@ -182,8 +181,7 @@ async def get_status(job_id: str):
                 created = datetime.fromisoformat(job["created_at"])
                 elapsed = (datetime.now(timezone.utc) - created).total_seconds()
                 
-                avg_seconds = elapsed / finished
-                crawled = job.get("crawled_pages", 0)
+                avg_seconds = elapsed / max(crawled, 1)
                 max_pages = job.get("max_pages", 300)
                 remaining = max(0, max_pages - crawled)
                 

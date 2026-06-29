@@ -59,9 +59,9 @@ def test_get_status_queued_and_processing_eta():
     assert data["status"] == "QUEUED"
     assert data["estimated_seconds_remaining"] is None
 
-    # 2. Processing job - early phase (no pages finished yet)
+    # 2. Processing job - early phase (no pages crawled yet)
     JOBS[job_id]["status"] = "PROCESSING"
-    JOBS[job_id]["crawled_pages"] = 1
+    JOBS[job_id]["crawled_pages"] = 0
     response = client.get(f"/api/crawl/{job_id}/status", headers=headers)
     assert response.status_code == 200
     data = response.json()
@@ -69,7 +69,6 @@ def test_get_status_queued_and_processing_eta():
 
     # 3. Processing job - estimated seconds remaining logic
     from datetime import timedelta
-    JOBS[job_id]["finished_pages"] = 2
     JOBS[job_id]["crawled_pages"] = 5
     JOBS[job_id]["created_at"] = (datetime.now(timezone.utc) - timedelta(seconds=10)).isoformat()
     
@@ -78,7 +77,7 @@ def test_get_status_queued_and_processing_eta():
     data = response.json()
     eta = data["estimated_seconds_remaining"]
     assert eta is not None
-    assert 470 <= eta <= 485
+    assert 180 <= eta <= 195
 
     # 4. Terminal job status (COMPLETED)
     JOBS[job_id]["status"] = "COMPLETED"
