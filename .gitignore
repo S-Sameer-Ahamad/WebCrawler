@@ -1,17 +1,42 @@
+# Python
 __pycache__/
-*.pyc
-.venv/
-venv/
-env/
-.env
-.env.*
-!.env.example
-crawl_output/
-*.log
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-.DS_Store
+*.py[cod]
+*.egg-info/
 dist/
 build/
-*.egg-info/
+.venv/
+venv/
+
+# Environment
+.env
+.env.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# AutoClaw workspace (not part of the crawler)
+memory/
+evolution-drafts/
+AGENTS.md
+SOUL.md
+IDENTITY.md
+USER.md
+TOOLS.md
+HEARTBEAT.md
+.openclaw/
+.openclaw-attachments/
+
+# Test artifacts
+.pytest_cache/
+.coverage
+htmlcov/

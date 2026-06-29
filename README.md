@@ -1,183 +1,145 @@
-# WebCrawler API
+# WebCrawler API v2
 
-A production-ready FastAPI crawler service that dynamically crawls websites using Playwright, cleans and extracts page content, and ingests markdown directly into the SaaS backend.
+Production-grade FastAPI crawler service. Uses Playwright for browser automation, extracts and cleans page content, and ingests markdown into a SaaS backend.
 
-## Architectural Flow
+## Architecture
+
 ```
-SaaS Backend 
-   │
-   │ (Trigger Crawl via POST /api/crawl)
-   ▼
-WebCrawler Service
-   │
-   │ (Playwright crawls & extracts pages)
-   ▼
-Target Website
-   │
-   │ (Returns cleaned markdown)
-   ▼
-WebCrawler Service
-   │
-   │ (Ingests markdown via POST /api/internal/crawler/pages)
-   ▼
-SaaS Backend (Ingests, chunks, embeds, and stores in database)
+SaaS Backend ← WebCrawler → Target Websites
+     │              │              │
+     │  POST /api/internal/crawler/pages
+     │              │              │
+     ▼              ▼              ▼
+  Ingestion    Crawl Engine    Playwright
+  Pipeline     (async pool)    (Chromium)
 ```
 
----
+## Project Structure
+
+```
+├── main.py                 # Entry point — thin bootstrap
+├── config.py               # Centralised settings from env
+├── models.py               # Pydantic request/response models
+├── crawler/
+│   ├── engine.py           # Core crawl orchestration
+│   ├── browser.py          # Playwright browser management
+│   ├── discovery.py        # Link harvesting (DOM, onclick, SPA, nav)
+│   ├── extractor.py        # Content extraction (selector cascade)
+│   ├── classifier.py       # Route type classification & scoring
+│   ├── dedup.py            # Thread-safe duplicate detection
+│   ├── quality.py          # Content quality checks
+│   ├── preprocessing.py    # Markdown noise removal
+│   ├── sitemap.py          # Sitemap discovery
+│   ├── robots.py           # Robots.txt fetching
+│   └── backend.py          # SaaS backend sender
+├── api/
+│   ├── routes.py           # FastAPI endpoints
+│   └── middleware.py        # Rate limiting, CORS
+├── utils/
+│   ├── url.py              # URL normalisation, filtering
+│   ├── text.py             # Text hashing, signatures
+│   └── logging.py          # Structured JSON logging
+├── tests/
+│   ├── conftest.py
+│   ├── test_url.py         # URL utilities
+│   ├── test_classifier.py  # Route classification
+│   ├── test_extractor.py   # Content extraction & quality
+│   └── test_dedup.py       # Dedup & preprocessing
+├── Dockerfile              # Multi-stage production build
+├── docker-compose.yml      # Local dev with health checks
+└── requirements.txt
+```
+
+## Quick Start
+
+```bash
+# Install
+pip install -r requirements.txt
+playwright install chromium
+
+# Configure
+cp .env.example .env
+# Edit .env with your tokens
+
+# Run
+python main.py
+
+# Test
+python -m pytest tests/ -v
+```
+
+## Docker
+
+```bash
+docker compose up -d
+```
 
 ## API Endpoints
 
-### 1. GET `/health`
-- **Description**: Public health check endpoint.
-- **Auth**: None (Public)
-- **Response**: `{"status": "healthy"}`
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| `GET` | `/health` | None | Health check + uptime |
+| `POST` | `/api/crawl` | `X-Crawler-API-Token` | Start crawl job |
+| `GET` | `/api/crawl/{id}/status` | `X-Crawler-API-Token` | Job status + stats |
+| `GET` | `/api/crawl/{id}/pages` | `X-Crawler-API-Token` | Paginated page list |
+| `GET` | `/docs` | None | OpenAPI docs |
 
-### 2. POST `/api/crawl`
-- **Description**: Trigger a new recursive crawl job.
-- **Auth**: Required header `X-Crawler-API-Token`
-- **Request Payload**:
+## Crawl Request
+
 ```json
 {
   "url": "https://example.com",
-  "tenant_id": "94380aa5-4e36-45b0-8892-eb2f91cc9a1f",
-  "agent_id": "758d0c23-d51c-4da5-b621-68ce723f62b2",
-  "max_depth": 0,
-  "max_pages": 1,
-  "min_markdown_chars": 10
+  "tenant_id": "94380aa5-...",
+  "agent_id": "758d0c23-...",
+  "max_depth": 5,
+  "max_pages": 300,
+  "concurrent_workers": 5,
+  "use_sitemap": true,
+  "min_markdown_chars": 120,
+  "min_detail_body_chars": 250
 }
 ```
-
-### 3. GET `/api/crawl/{job_id}/status`
-- **Description**: Get the current status and metrics of a crawl job.
-- **Auth**: Required header `X-Crawler-API-Token`
-- **Response Payload**:
-```json
-{
-  "job_id": "d421bf2af153",
-  "status": "COMPLETED",
-  "created_at": "2026-06-19T14:30:31.084012",
-  "updated_at": "2026-06-19T14:30:39.922476",
-  "crawled_pages": 1,
-  "sent_pages": 1,
-  "failed_sends": 0,
-  "rejected_urls": 2,
-  "skipped_duplicates": 0,
-  "current_url": "https://example.com/",
-  "last_error": null,
-  "menus_interacted": 1,
-  "clicks_interacted": 1,
-  "nav_links_found": 0,
-  "click_links_found": 0,
-  "hash_links_found": 0,
-  "navigation_links_found": 0,
-  "onclick_links_found": 0,
-  "discovered_urls": 1,
-  "completed_at": "2026-06-19T14:30:39.922476"
-}
-```
-
----
-
-## Authentication & Headers
-
-| Direction | Endpoint | Header | Purpose |
-| :--- | :--- | :--- | :--- |
-| **Inbound** | `POST /api/crawl` / `GET /status` | `X-Crawler-API-Token` | Authenticates SaaS/Admin calling the Crawler API |
-| **Outbound** | `POST /api/internal/crawler/pages` | `X-Internal-Crawler-Token` | Authenticates Crawler calling the SaaS Ingestion Endpoint |
-
----
 
 ## Environment Variables
 
-Configure these variables in your environment or a local `.env` file (see `.env.example`):
-- `SAAS_BACKEND_URL`: URL of the SaaS Backend API (e.g., `https://api.yourdomain.com`).
-- `CRAWLER_INTERNAL_TOKEN`: Authentication token used for outbound requests to the SaaS backend.
-- `CRAWLER_API_TOKEN`: Authentication token required by clients invoking this crawler service.
-- `MAX_BACKEND_SEND_CONCURRENCY`: Concurrency limit for backend page requests (default: 3).
-- `MAX_BACKEND_FAILURE_RATE`: Threshold ratio of failed page sends to abort crawl (default: 0.8).
-- `MIN_SEND_ATTEMPTS_BEFORE_ABORT`: Minimum send attempts before evaluating failure threshold (default: 5).
-- `PORT`: Uvicorn server port (default: 8765).
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SAAS_BACKEND_URL` | — | SaaS ingestion endpoint |
+| `CRAWLER_INTERNAL_TOKEN` | — | Outbound auth token |
+| `CRAWLER_API_TOKEN` | — | Inbound auth token |
+| `MAX_BACKEND_SEND_CONCURRENCY` | 3 | Parallel backend sends |
+| `MAX_BACKEND_FAILURE_RATE` | 0.8 | Abort threshold |
+| `MIN_SEND_ATTEMPTS_BEFORE_ABORT` | 5 | Before failure check |
+| `JOB_TTL_SECONDS` | 7200 | Auto-expire completed jobs |
+| `MAX_ACTIVE_JOBS` | 10 | Concurrent job limit |
+| `PORT` | 8765 | Server port |
+| `LOG_LEVEL` | INFO | DEBUG/INFO/WARNING/ERROR |
+| `RATE_LIMIT_REQUESTS` | 30 | Requests per window |
+| `RATE_LIMIT_WINDOW_SECONDS` | 60 | Rate limit window |
+| `CORS_ORIGINS` | * | Allowed CORS origins |
 
----
+## Production Changes (v1 → v2)
 
-## Local Setup & Development
+- **Modular structure**: 1 file → 15 modules across 4 packages
+- **Structured logging**: `print()` → JSON log lines with levels
+- **Config validation**: scattered `os.environ` → validated `Settings` dataclass
+- **Rate limiting**: per-IP sliding window middleware
+- **Graceful shutdown**: FastAPI lifespan with cleanup task cancellation
+- **CORS**: configurable middleware
+- **Max active jobs**: prevents resource exhaustion
+- **Health check**: includes uptime + structured response
+- **Pagination**: `/pages` endpoint supports `page`/`page_size`
+- **Error responses**: structured with `error_code` field
+- **Bare except audit**: all `except Exception: pass` reviewed and either logged or narrowed
+- **Multi-stage Dockerfile**: non-root user, health check, layer caching
+- **Test suite**: 92 tests covering URL utils, classification, extraction, quality, dedup
+- **Dependencies pinned**: added `lxml`, minimum versions for all packages
 
-1. **Install Dependencies**:
-   ```bash
-   pip install -r requirements.txt
-   ```
-2. **Install Playwright Browsers**:
-   ```bash
-   playwright install chromium
-   ```
-3. **Run Server**:
-   ```bash
-   python main.py
-   ```
+## Security
 
----
-
-## Docker Execution
-
-1. **Build Docker Image**:
-   ```bash
-   docker build -t webcrawler .
-   ```
-2. **Run Container**:
-   ```bash
-   docker run -p 8765:8765 \
-     -e SAAS_BACKEND_URL="https://your-saas-backend.com" \
-     -e CRAWLER_INTERNAL_TOKEN="your_internal_token" \
-     -e CRAWLER_API_TOKEN="your_api_token" \
-     webcrawler
-   ```
-
----
-
-## Deploying to Render
-
-1. Create a new **Web Service** on Render.
-2. Select your repository `https://github.com/S-Sameer-Ahamad/WebCrawler.git`.
-3. Choose the environment **Docker**.
-4. Render will automatically read the `Dockerfile` to build and deploy the container.
-5. In the **Environment** tab on Render, add the required variables:
-   - `SAAS_BACKEND_URL`
-   - `CRAWLER_INTERNAL_TOKEN`
-   - `CRAWLER_API_TOKEN`
-   - `MAX_BACKEND_SEND_CONCURRENCY`
-   - `MAX_BACKEND_FAILURE_RATE`
-   - `MIN_SEND_ATTEMPTS_BEFORE_ABORT`
-
----
-
-## Example Usage (cURL)
-
-### Trigger a Crawl
-```bash
-curl -X POST http://localhost:8765/api/crawl \
-  -H "Content-Type: application/json" \
-  -H "X-Crawler-API-Token: your_api_token" \
-  -d '{
-    "url": "https://example.com",
-    "tenant_id": "94380aa5-4e36-45b0-8892-eb2f91cc9a1f",
-    "agent_id": "758d0c23-d51c-4da5-b621-68ce723f62b2",
-    "max_depth": 0,
-    "max_pages": 1
-  }'
-```
-
-### Fetch Job Status
-```bash
-curl -H "X-Crawler-API-Token: your_api_token" \
-  http://localhost:8765/api/crawl/your_job_id/status
-```
-
----
-
-## Security Notes
-- **Server-Side Only**: The frontend must never call this crawler directly.
-- **Token Protection**: Tokens must remain server-side. Never expose keys in client-side applications.
-- **Configuration Hygiene**: Never commit real secrets to Git. Always add `.env` to your `.gitignore`.
-
-## Limitations
-- **In-Memory Tracking**: Crawl job status tracking is currently in-memory. Metrics and job status do not persist across crawler restarts.
+- Inbound requests require `X-Crawler-API-Token` header
+- Outbound requests use `X-Internal-Crawler-Token` for backend auth
+- Rate limiting prevents API abuse
+- CORS is configurable (defaults to allow all for API use)
+- Docker runs as non-root user
+- Tokens never exposed in responses or logs
